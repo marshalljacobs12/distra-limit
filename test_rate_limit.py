@@ -1,14 +1,14 @@
 import requests
 import time
 
-BASE_URL = "http://localhost:8000/products"
+BASE_URL = "http://localhost/products"  # Nginx endpoint
 USER_ID = "test_user"
 HEADERS = {"X-User-ID": USER_ID}
 MAX_REQUESTS = 100
 TEST_REQUESTS = 105
 
 def test_rate_limit():
-    print(f"Testing {MAX_REQUESTS} req/min for '{USER_ID}'")
+    print(f"Testing {MAX_REQUESTS} req/min for '{USER_ID}' across nodes")
     results = []
     start_time = time.time()
     for i in range(TEST_REQUESTS):
@@ -29,6 +29,6 @@ def test_rate_limit():
     print(f"Failed: {results.count(None)}")
 
 if __name__ == "__main__":
-    print("Ensure FastAPI is running...")
+    print("Ensure Docker Compose is running...")
     time.sleep(2)
     test_rate_limit()

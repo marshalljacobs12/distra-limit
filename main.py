@@ -9,8 +9,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Redis client (assumes Redis on localhost:6379)
-redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+# Redis client (will use env vars in Step 6, hardcoded for now)
+redis_client = redis.Redis(host="redis", port=6379, db=0, decode_responses=True)
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
