@@ -8,8 +8,8 @@ exceptiongroup==1.2.2
 fastapi==0.110.0
 h11==0.14.0
 idna==3.10
-pydantic==2.10.6
-pydantic_core==2.27.2
+pydantic==2.10.2
+pydantic_core==2.27.1
 python-dotenv==1.0.1
 redis==5.0.3
 requests==2.32.3
