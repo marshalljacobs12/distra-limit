@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "distra-limit"
+    static_configs:
+      - targets: ["app1:8000", "app2:8000"]

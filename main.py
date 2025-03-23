@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Counter, Gauge
 import redis.asyncio as redis
 from time import time
 import logging
@@ -30,7 +32,7 @@ redis_client = redis.Redis(
 # Rate limit defaults
 DEFAULT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 DEFAULT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "100"))
-DEFAULT_BURST = int(os.getenv("RATE_LIMIT_BURST", "20"))  # Default burst capacity
+DEFAULT_BURST = int(os.getenv("RATE_LIMIT_BURST", "20"))
 
 # Endpoint-specific rate limits (loaded from env)
 ENDPOINT_LIMITS = {
@@ -46,6 +48,20 @@ ENDPOINT_LIMITS = {
     }
 }
 logger.info(f"Loaded ENDPOINT_LIMITS: {ENDPOINT_LIMITS}")
+
+# Metrics
+REQUESTS_TOTAL = Counter(
+    "http_requests_total", "Total HTTP requests", ["endpoint", "status"]
+)
+RATE_LIMIT_HITS = Counter(
+    "rate_limit_hits_total", "Total rate limit hits", ["endpoint"]
+)
+TOKENS_REMAINING = Gauge(
+    "tokens_remaining", "Remaining tokens in bucket", ["endpoint", "user_id"]
+)
+
+# Instrument FastAPI for default metrics
+instrumentator = Instrumentator().instrument(app)
 
 # Lua script for atomic token bucket check and update 
 TOKEN_BUCKET_SCRIPT = """
@@ -88,6 +104,7 @@ async def startup_event():
         logger.info("Token bucket script loaded")
     except Exception as e:
         logger.error(f"Redis connection failed: {e}")
+    instrumentator.expose(app)  # Expose /metrics endpoint
 
 class CartItem(BaseModel):
     item: str
@@ -119,17 +136,21 @@ async def rate_limit(request: Request, call_next):
         max_requests,
         burst
     )
-    tokens_left = await redis_client.hget(key, "tokens")
-    logger.debug(f"User {user_id} at {path}: Allowed={allowed}, Tokens={tokens_left or 'N/A'}")
+    tokens_left = float(await redis_client.hget(key, "tokens") or (max_requests + burst))
+    TOKENS_REMAINING.labels(endpoint=path, user_id=user_id).set(tokens_left)
+    logger.debug(f"User {user_id} at {path}: Allowed={allowed}, Tokens={tokens_left}")
 
     if not allowed:
+        RATE_LIMIT_HITS.labels(endpoint=path).inc()
         logger.info(f"Rate limit hit for {user_id} at {path}: No tokens available")
+        REQUESTS_TOTAL.labels(endpoint=path, status="429").inc()
         return JSONResponse(
             status_code=429,
             content={"detail": f"Rate limit exceeded for {path}"}
         )
 
     response = await call_next(request)
+    REQUESTS_TOTAL.labels(endpoint=path, status=str(response.status_code)).inc()
     return response
 
 @app.get("/products")

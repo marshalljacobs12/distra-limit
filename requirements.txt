@@ -8,6 +8,8 @@ exceptiongroup==1.2.2
 fastapi==0.110.0
 h11==0.14.0
 idna==3.10
+prometheus-fastapi-instrumentator==7.0.0
+prometheus_client==0.21.1
 pydantic==2.10.2
 pydantic_core==2.27.1
 python-dotenv==1.0.1
