@@ -8,6 +8,7 @@ from time import time
 import logging
 import os
 from dotenv import load_dotenv
+from typing import Dict, Optional
 
 load_dotenv()
 
@@ -33,6 +34,7 @@ redis_client = redis.Redis(
 DEFAULT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 DEFAULT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "100"))
 DEFAULT_BURST = int(os.getenv("RATE_LIMIT_BURST", "20"))
+NUM_INSTANCES = int(os.getenv("NUM_INSTANCES", "2"))  # Default to 2 instances
 
 # Endpoint-specific rate limits (loaded from env)
 ENDPOINT_LIMITS = {
@@ -58,6 +60,9 @@ RATE_LIMIT_HITS = Counter(
 )
 TOKENS_REMAINING = Gauge(
     "tokens_remaining", "Remaining tokens in bucket", ["endpoint", "user_id"]
+)
+REDIS_FAILURES = Counter(
+    "redis_failures_total", "Total Redis connection failures"
 )
 
 # Instrument FastAPI for default metrics
@@ -93,17 +98,50 @@ else
 end
 """
 
+# Declare token_bucket_sha and use_redis at module level
+token_bucket_sha: Optional[str] = None
+use_redis: bool = True  # Flag to toggle Redis usage
+
+# In-memory token bucket for fallback
+class InMemoryTokenBucket:
+    def __init__(self, max_requests: int, burst: int, window: int, num_instances: int):
+        self.max_requests = max_requests // num_instances  # Divide by number of instances
+        self.burst = burst // num_instances
+        self.window = window
+        self.replenish_rate = self.max_requests / window
+        self.buckets: Dict[str, tuple[float, float]] = {}  # key: (tokens, last_update)
+        logger.info(f"In-memory bucket initialized: max_requests={self.max_requests}, burst={self.burst}, num_instances={num_instances}")
+
+    def check_and_update(self, key: str, now: float) -> bool:
+        tokens, last_update = self.buckets.get(key, (self.max_requests + self.burst, now))
+        elapsed = now - last_update
+        new_tokens = min(self.max_requests + self.burst, tokens + (elapsed * self.replenish_rate))
+        logger.debug(f"In-memory bucket: key={key}, tokens={tokens}, elapsed={elapsed}, new_tokens={new_tokens}")
+        if new_tokens >= 1:
+            new_tokens -= 1
+            self.buckets[key] = (new_tokens, now)
+            logger.debug(f"Allowed: new_tokens={new_tokens}")
+            return True
+        logger.debug(f"Denied: new_tokens={new_tokens}")
+        return False
+
+fallback_buckets: Dict[str, InMemoryTokenBucket] = {}
+
 @app.on_event("startup")
 async def startup_event():
+    global token_bucket_sha, use_redis
     try:
         await redis_client.ping()
         logger.info("Redis connection successful")
         # Load Lua script during startup
-        global token_bucket_sha
         token_bucket_sha = await redis_client.script_load(TOKEN_BUCKET_SCRIPT)
         logger.info("Token bucket script loaded")
+        use_redis = True
     except Exception as e:
-        logger.error(f"Redis connection failed: {e}")
+        REDIS_FAILURES.inc()
+        logger.error(f"Redis connection failed: {e}. Using in-memory fallback.")
+        token_bucket_sha = "in_memory"  # Flag for initial failure
+        use_redis = False
     instrumentator.expose(app)  # Expose /metrics endpoint
 
 class CartItem(BaseModel):
@@ -111,6 +149,7 @@ class CartItem(BaseModel):
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
+    global use_redis
     user_id = request.headers.get("X-User-ID", "default")
     path = request.url.path  # e.g., "/products" or "/cart"
     now = time()
@@ -126,19 +165,40 @@ async def rate_limit(request: Request, call_next):
     burst = limits["burst"]
     key = f"rate:{user_id}:{path}"
 
-    # Execute token bucket script
-    allowed = await redis_client.evalsha(
-        token_bucket_sha,
-        1,  # Number of keys
-        key,
-        now,
-        window,
-        max_requests,
-        burst
-    )
-    tokens_left = float(await redis_client.hget(key, "tokens") or (max_requests + burst))
+    allowed: Optional[bool] = None
+    tokens_left: float = max_requests + burst  # Default for metrics if Redis fails
+
+    if use_redis:  # Try Redis first
+        try:
+            allowed = await redis_client.evalsha(
+                token_bucket_sha,
+                1,  # Number of keys
+                key,
+                now,
+                window,
+                max_requests,
+                burst
+            )
+            tokens_left_raw = await redis_client.hget(key, "tokens")
+            tokens_left = float(tokens_left_raw) if tokens_left_raw is not None else max_requests + burst
+        except Exception as e:
+            REDIS_FAILURES.inc()
+            logger.warning(f"Redis failed during request: {e}. Switching to in-memory fallback.")
+            use_redis = False
+
+    if not use_redis:  # Use in-memory fallback
+        if path not in fallback_buckets:
+            fallback_buckets[path] = InMemoryTokenBucket(max_requests, burst, window, NUM_INSTANCES)
+        bucket = fallback_buckets[path]
+        allowed = bucket.check_and_update(key, now)
+        tokens_left = bucket.buckets.get(key, (bucket.max_requests + bucket.burst, now))[0]
+
     TOKENS_REMAINING.labels(endpoint=path, user_id=user_id).set(tokens_left)
     logger.debug(f"User {user_id} at {path}: Allowed={allowed}, Tokens={tokens_left}")
+
+    if allowed is None:
+        logger.error(f"Allowed is None for {key} - defaulting to deny")
+        allowed = False
 
     if not allowed:
         RATE_LIMIT_HITS.labels(endpoint=path).inc()
@@ -162,7 +222,24 @@ async def add_to_cart(cart_item: CartItem):
     logger.debug(f"Received POST to /cart with item: {cart_item.item}")
     return {"message": f"Added {cart_item.item} to cart"}
 
+@app.get("/health")
+async def health_check():
+    redis_status = "up"
+    try:
+        await redis_client.ping()
+    except Exception as e:
+        redis_status = f"down: {str(e)}"
+        REDIS_FAILURES.inc()
+    return {
+        "status": "healthy" if redis_status == "up" else "degraded",
+        "redis": redis_status,
+        "fallback": "active" if not use_redis else "inactive"
+    }
+
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("Closing Redis connection")
-    await redis_client.close()
+    try:
+        await redis_client.close()
+    except Exception as e:
+        logger.warning(f"Error closing Redis: {e}")
