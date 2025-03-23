@@ -30,18 +30,64 @@ redis_client = redis.Redis(
 # Rate limit defaults
 DEFAULT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 DEFAULT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "100"))
+DEFAULT_BURST = int(os.getenv("RATE_LIMIT_BURST", "20"))  # Default burst capacity
 
 # Endpoint-specific rate limits (loaded from env)
 ENDPOINT_LIMITS = {
     "/products": {
         "window": int(os.getenv("RATE_LIMIT_WINDOW_PRODUCTS", DEFAULT_WINDOW)),
-        "max_requests": int(os.getenv("RATE_LIMIT_MAX_REQUESTS_PRODUCTS", DEFAULT_MAX_REQUESTS))
+        "max_requests": int(os.getenv("RATE_LIMIT_MAX_REQUESTS_PRODUCTS", DEFAULT_MAX_REQUESTS)),
+        "burst": int(os.getenv("RATE_LIMIT_BURST_PRODUCTS", DEFAULT_BURST))
     },
     "/cart": {
         "window": int(os.getenv("RATE_LIMIT_WINDOW_CART", DEFAULT_WINDOW)),
-        "max_requests": int(os.getenv("RATE_LIMIT_MAX_REQUESTS_CART", DEFAULT_MAX_REQUESTS))
+        "max_requests": int(os.getenv("RATE_LIMIT_MAX_REQUESTS_CART", DEFAULT_MAX_REQUESTS)),
+        "burst": int(os.getenv("RATE_LIMIT_BURST_CART", DEFAULT_BURST))
     }
 }
+logger.info(f"Loaded ENDPOINT_LIMITS: {ENDPOINT_LIMITS}")
+
+# Lua script for atomic token bucket check and update 
+TOKEN_BUCKET_SCRIPT = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local max_requests = tonumber(ARGV[3])
+local burst = tonumber(ARGV[4])
+local replenish_rate = max_requests / window
+
+-- Get current tokens and last update time
+local tokens = redis.call('HGET', key, 'tokens') or max_requests + burst
+local last_update = redis.call('HGET', key, 'last_update') or now
+tokens = tonumber(tokens)
+last_update = tonumber(last_update)
+
+-- Calculate tokens replenished since last update
+local elapsed = now - last_update
+local new_tokens = math.min(max_requests + burst, tokens + (elapsed * replenish_rate))
+
+-- Check if enough tokens for this request
+if new_tokens >= 1 then
+    new_tokens = new_tokens - 1
+    redis.call('HMSET', key, 'tokens', new_tokens, 'last_update', now)
+    redis.call('EXPIRE', key, window)
+    return 1  -- Success
+else
+    return 0  -- Rate limited
+end
+"""
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        await redis_client.ping()
+        logger.info("Redis connection successful")
+        # Load Lua script during startup
+        global token_bucket_sha
+        token_bucket_sha = await redis_client.script_load(TOKEN_BUCKET_SCRIPT)
+        logger.info("Token bucket script loaded")
+    except Exception as e:
+        logger.error(f"Redis connection failed: {e}")
 
 class CartItem(BaseModel):
     item: str
@@ -55,29 +101,33 @@ async def rate_limit(request: Request, call_next):
     # Get endpoint-specific limits, fall back to defaults
     limits = ENDPOINT_LIMITS.get(path, {
         "window": DEFAULT_WINDOW,
-        "max_requests": DEFAULT_MAX_REQUESTS
+        "max_requests": DEFAULT_MAX_REQUESTS,
+        "burst": DEFAULT_BURST
     })
     window = limits["window"]
     max_requests = limits["max_requests"]
+    burst = limits["burst"]
     key = f"rate:{user_id}:{path}"
 
-    # Get current request count
-    await redis_client.zremrangebyscore(key, 0, now - window)
-    current_count = await redis_client.zcard(key)
-    logger.debug(f"User {user_id} at {path}: {current_count} requests")
+    # Execute token bucket script
+    allowed = await redis_client.evalsha(
+        token_bucket_sha,
+        1,  # Number of keys
+        key,
+        now,
+        window,
+        max_requests,
+        burst
+    )
+    tokens_left = await redis_client.hget(key, "tokens")
+    logger.debug(f"User {user_id} at {path}: Allowed={allowed}, Tokens={tokens_left or 'N/A'}")
 
-    # Check limit
-    if current_count >= max_requests:
-        logger.info(f"Rate limit hit for {user_id} at {path}: {current_count} >= {max_requests}")
+    if not allowed:
+        logger.info(f"Rate limit hit for {user_id} at {path}: No tokens available")
         return JSONResponse(
             status_code=429,
             content={"detail": f"Rate limit exceeded for {path}"}
         )
-
-    # Add current request timestamp
-    await redis_client.zadd(key, {str(now): now})
-    await redis_client.expire(key, window) # Auto-expire after window
-    logger.debug(f"Added request at {path}, new count: {current_count + 1}")
 
     response = await call_next(request)
     return response
